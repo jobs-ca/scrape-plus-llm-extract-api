@@ -303,11 +303,11 @@ async def perform_enhanced_scraping(url: str, request_id: str, delay_ms: int = 5
             """)
 
             try:
-                # Navigate with extended timeout for Cloudflare challenges
-                logger.info(f"[{request_id}] Navigating to URL with 30s timeout...")
-                await page.goto(url, 
-                    wait_until='domcontentloaded',  # or 'networkidle' for SPAs
-                    timeout=45000  # 45 second timeout for slow sites/Cloudflare
+                # Navigate with extended timeout for Cloudflare challenges and SPAs
+                logger.info(f"[{request_id}] Navigating to URL with 60s timeout...")
+                await page.goto(url,
+                    wait_until='networkidle',  # waits for all network requests (API calls, JS bundles) to finish - handles SPAs correctly
+                    timeout=60000  # 60 second timeout for slow sites/Cloudflare/large JS bundles
                 )
             
                 # Check for Cloudflare challenge
