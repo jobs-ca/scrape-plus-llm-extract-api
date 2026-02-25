@@ -69,7 +69,7 @@ async def health():
         "resources": status
     }
 
-async def perform_enhanced_scraping(url: str, request_id: str, delay_ms: int = 5000, enable_scrolling: Optional[bool] = None, scrolling_type: Literal["human", "bot"] = "bot"):
+async def perform_enhanced_scraping(url: str, request_id: str, delay_ms: int = 5000, enable_scrolling: Optional[bool] = None, scrolling_type: Literal["human", "bot"] = "bot", wait_for_selector: Optional[str] = None, wait_for_selector_timeout: int = 30000):
     """
     Reusable enhanced scraping function with anti-detection measures.
     Auto-enables bot scrolling when delay_ms <= 5000 (unless explicitly set).
@@ -374,9 +374,18 @@ async def perform_enhanced_scraping(url: str, request_id: str, delay_ms: int = 5
                     await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                     await page.wait_for_timeout(500)  # Brief wait for any lazy-loaded content
             
+                # Wait for a specific selector to appear (useful for SPAs that render content asynchronously)
+                if wait_for_selector:
+                    try:
+                        logger.info(f"[{request_id}] Waiting for selector: '{wait_for_selector}' (timeout: {wait_for_selector_timeout}ms)")
+                        await page.wait_for_selector(wait_for_selector, timeout=wait_for_selector_timeout)
+                        logger.info(f"[{request_id}] Selector '{wait_for_selector}' found in DOM")
+                    except PlaywrightTimeout:
+                        logger.warning(f"[{request_id}] Selector '{wait_for_selector}' not found within {wait_for_selector_timeout}ms, continuing with current content")
+
                 # Final wait for any lazy-loaded content
                 await page.wait_for_timeout(2000)
-            
+
                 logger.info(f"[{request_id}] Extracting page content...")
                 html_content = await page.content()
                 logger.info(f"[{request_id}] HTML content extracted (size: {len(html_content)} chars)")
@@ -434,27 +443,31 @@ async def perform_enhanced_scraping(url: str, request_id: str, delay_ms: int = 5
 
 @router.get("/scrape")
 async def scrape_url(
-    url: str, 
-    enable_scrolling: Optional[bool] = None, 
+    url: str,
+    enable_scrolling: Optional[bool] = None,
     scrolling_type: Literal["human", "bot"] = "bot",
-    delay_ms: int = 5000
+    delay_ms: int = 5000,
+    wait_for_selector: Optional[str] = None,
+    wait_for_selector_timeout: int = 30000
 ):
     start_time = time.time()
     request_id = f"{int(time.time() * 1000)}"
-    
+
     logger.info(f"[{request_id}] ===== SCRAPE REQUEST RECEIVED =====")
     logger.info(f"[{request_id}] URL: {url}")
-    
+
     try:
         scrape_start = time.time()
-        
+
         # Use the enhanced scraping function
         html_content, error = await perform_enhanced_scraping(
-            url, 
+            url,
             request_id,
             delay_ms=delay_ms,
             enable_scrolling=enable_scrolling,
-            scrolling_type=scrolling_type
+            scrolling_type=scrolling_type,
+            wait_for_selector=wait_for_selector,
+            wait_for_selector_timeout=wait_for_selector_timeout
         )
         
         if error:
@@ -513,6 +526,8 @@ class ScrapeRequest(BaseModel):
     enable_scrolling: Optional[bool] = None  # None means auto-decide based on delay
     scrolling_type: Literal["human", "bot"] = "bot"
     delay_ms: int = 5000
+    wait_for_selector: Optional[str] = None
+    wait_for_selector_timeout: int = 30000
 
 
 @router.post("/scrape")
@@ -522,7 +537,9 @@ async def scrape_url_post(request: ScrapeRequest):
         url=request.url,
         enable_scrolling=request.enable_scrolling,
         scrolling_type=request.scrolling_type,
-        delay_ms=request.delay_ms
+        delay_ms=request.delay_ms,
+        wait_for_selector=request.wait_for_selector,
+        wait_for_selector_timeout=request.wait_for_selector_timeout
     )
 
 
@@ -613,6 +630,8 @@ class ExtractRequest(BaseModel):
     enable_scrolling: Optional[bool] = None  # None means auto-decide based on delay
     scrolling_type: Literal["human", "bot"] = "bot"  # Type of scrolling
     delay_page_load: int = 5000  # Delay in milliseconds for page load
+    wait_for_selector: Optional[str] = None  # CSS selector to wait for before capturing content (useful for SPAs)
+    wait_for_selector_timeout: int = 30000  # Timeout in ms for wait_for_selector (default 30s)
 
 @router.post("/scrape/llm-extract")
 async def scrape_and_extract(request: ExtractRequest):
@@ -642,11 +661,13 @@ async def scrape_and_extract(request: ExtractRequest):
         
         # Use the enhanced scraping function
         html_content, error = await perform_enhanced_scraping(
-            request.url, 
-            request_id, 
+            request.url,
+            request_id,
             delay_ms=request.delay_page_load,
             enable_scrolling=request.enable_scrolling,
-            scrolling_type=request.scrolling_type
+            scrolling_type=request.scrolling_type,
+            wait_for_selector=request.wait_for_selector,
+            wait_for_selector_timeout=request.wait_for_selector_timeout
         )
         
         if error:
