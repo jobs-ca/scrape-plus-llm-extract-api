@@ -69,10 +69,115 @@ async def health():
         "resources": status
     }
 
-async def perform_enhanced_scraping(url: str, request_id: str, delay_ms: int = 5000, enable_scrolling: Optional[bool] = None, scrolling_type: Literal["human", "bot"] = "bot", wait_for_selector: Optional[str] = None, wait_for_selector_timeout: int = 30000):
+async def auto_paginate_click(page, request_id: str, max_pages: int = 20, click_wait_ms: int = 2500):
+    """
+    Auto-detect a "Next page" pagination control on an SPA and click through it,
+    collecting HTML from each page. Used when the URL does not change on pagination.
+
+    Returns a list of HTML strings (one per page). Always includes at least page 1.
+    Stops when no Next button is found, the button is disabled, content stops
+    changing, or max_pages is reached.
+    """
+    # Conservative, pagination-scoped selectors only — avoid naked text matches that
+    # could click unrelated "Next" buttons (wizard steps, carousels, etc.)
+    NEXT_SELECTORS = [
+        'a[rel="next"]',
+        'nav[aria-label*="pagination" i] a:has-text("Next")',
+        'nav[aria-label*="pagination" i] button:has-text("Next")',
+        'nav[aria-label*="pagination" i] a:has-text("Suivant")',
+        'nav[aria-label*="pagination" i] button:has-text("Suivant")',
+        '.pagination a:has-text("Next")',
+        '.pagination button:has-text("Next")',
+        '.pagination a:has-text("Suivant")',
+        '.pagination button:has-text("Suivant")',
+        'nav[aria-label*="pagination" i] [aria-label*="Next" i]',
+        '.pagination [aria-label*="Next" i]',
+    ]
+
+    async def find_next_button():
+        for selector in NEXT_SELECTORS:
+            try:
+                btn = await page.query_selector(selector)
+                if not btn:
+                    continue
+                if not await btn.is_visible():
+                    continue
+                if await btn.is_disabled():
+                    continue
+                cls = (await btn.get_attribute('class')) or ''
+                aria_disabled = (await btn.get_attribute('aria-disabled')) or ''
+                if 'disabled' in cls.lower() or aria_disabled.lower() == 'true':
+                    continue
+                return btn, selector
+            except Exception:
+                continue
+        return None, None
+
+    # Snapshot the base URL before any clicks. After clicking a pagination button,
+    # the URL is allowed to gain query params or fragments (e.g. ?page=2 or #p=2)
+    # but it must still start with this base — anything else means we navigated
+    # away from the careers page (clicked the wrong button).
+    base_url = page.url
+    # Strip any existing query/fragment so "?p=1" -> "?p=2" doesn't fail startswith.
+    base_prefix = base_url.split('?')[0].split('#')[0]
+
+    pages_html = [await page.content()]
+    last_content_hash = hash(pages_html[0])
+
+    for i in range(max_pages - 1):
+        btn, selector = await find_next_button()
+        if not btn:
+            logger.info(f"[{request_id}] Auto-pagination: no Next button found after page {i + 1}, stopping")
+            break
+
+        logger.info(f"[{request_id}] Auto-pagination: clicking Next (page {i + 2}) via selector {selector}")
+        try:
+            await btn.click(timeout=5000)
+        except Exception as e:
+            logger.warning(f"[{request_id}] Auto-pagination: click failed on page {i + 2}: {e}")
+            break
+
+        await page.wait_for_timeout(click_wait_ms)
+        try:
+            await page.wait_for_load_state('networkidle', timeout=10000)
+        except PlaywrightTimeout:
+            pass
+
+        # Safety: make sure we're still on the careers page. Query params and
+        # fragments may change (?page=2, #p=2) — base path must not.
+        current_url = page.url
+        current_prefix = current_url.split('?')[0].split('#')[0]
+        if current_prefix != base_prefix:
+            logger.warning(
+                f"[{request_id}] Auto-pagination: URL path changed after click "
+                f"({base_prefix} -> {current_prefix}), aborting to avoid scraping wrong page"
+            )
+            break
+
+        new_html = await page.content()
+        new_hash = hash(new_html)
+        if new_hash == last_content_hash:
+            logger.info(f"[{request_id}] Auto-pagination: content unchanged after click, stopping")
+            break
+
+        pages_html.append(new_html)
+        last_content_hash = new_hash
+
+    if len(pages_html) > 1:
+        logger.info(f"[{request_id}] Auto-pagination: collected {len(pages_html)} pages")
+
+    return pages_html
+
+
+async def perform_enhanced_scraping(url: str, request_id: str, delay_ms: int = 5000, enable_scrolling: Optional[bool] = None, scrolling_type: Literal["human", "bot"] = "bot", wait_for_selector: Optional[str] = None, wait_for_selector_timeout: int = 30000, auto_paginate: bool = False):
     """
     Reusable enhanced scraping function with anti-detection measures.
     Auto-enables bot scrolling when delay_ms <= 5000 (unless explicitly set).
+
+    When auto_paginate=True, will try to detect a "Next" pagination button on
+    SPAs (where the URL does not change on page change), click through it, and
+    return the combined HTML of all visited pages separated by a marker comment.
+
     Returns: (html_content, error_dict or None)
     """
     # Auto-enable bot scrolling for delay <= 5000ms if not explicitly set
@@ -386,10 +491,19 @@ async def perform_enhanced_scraping(url: str, request_id: str, delay_ms: int = 5
                 # Final wait for any lazy-loaded content
                 await page.wait_for_timeout(2000)
 
-                logger.info(f"[{request_id}] Extracting page content...")
-                html_content = await page.content()
-                logger.info(f"[{request_id}] HTML content extracted (size: {len(html_content)} chars)")
-            
+                if auto_paginate:
+                    pages_html = await auto_paginate_click(page, request_id)
+                    if len(pages_html) > 1:
+                        html_content = '\n\n<!-- PAGE_SEPARATOR -->\n\n'.join(pages_html)
+                        logger.info(f"[{request_id}] HTML content extracted from {len(pages_html)} pages (total size: {len(html_content)} chars)")
+                    else:
+                        html_content = pages_html[0]
+                        logger.info(f"[{request_id}] HTML content extracted (size: {len(html_content)} chars) — no pagination detected")
+                else:
+                    logger.info(f"[{request_id}] Extracting page content...")
+                    html_content = await page.content()
+                    logger.info(f"[{request_id}] HTML content extracted (size: {len(html_content)} chars)")
+
                 return html_content, None
             
             except PlaywrightTimeout as e:
@@ -448,7 +562,8 @@ async def scrape_url(
     scrolling_type: Literal["human", "bot"] = "bot",
     delay_ms: int = 5000,
     wait_for_selector: Optional[str] = None,
-    wait_for_selector_timeout: int = 30000
+    wait_for_selector_timeout: int = 30000,
+    auto_paginate: bool = False
 ):
     start_time = time.time()
     request_id = f"{int(time.time() * 1000)}"
@@ -467,9 +582,10 @@ async def scrape_url(
             enable_scrolling=enable_scrolling,
             scrolling_type=scrolling_type,
             wait_for_selector=wait_for_selector,
-            wait_for_selector_timeout=wait_for_selector_timeout
+            wait_for_selector_timeout=wait_for_selector_timeout,
+            auto_paginate=auto_paginate
         )
-        
+
         if error:
             return error
 
@@ -528,6 +644,7 @@ class ScrapeRequest(BaseModel):
     delay_ms: int = 5000
     wait_for_selector: Optional[str] = None
     wait_for_selector_timeout: int = 30000
+    auto_paginate: bool = False  # Click through SPA pagination where URL doesn't change
 
 
 @router.post("/scrape")
@@ -539,7 +656,8 @@ async def scrape_url_post(request: ScrapeRequest):
         scrolling_type=request.scrolling_type,
         delay_ms=request.delay_ms,
         wait_for_selector=request.wait_for_selector,
-        wait_for_selector_timeout=request.wait_for_selector_timeout
+        wait_for_selector_timeout=request.wait_for_selector_timeout,
+        auto_paginate=request.auto_paginate
     )
 
 
@@ -632,6 +750,7 @@ class ExtractRequest(BaseModel):
     delay_page_load: int = 5000  # Delay in milliseconds for page load
     wait_for_selector: Optional[str] = None  # CSS selector to wait for before capturing content (useful for SPAs)
     wait_for_selector_timeout: int = 30000  # Timeout in ms for wait_for_selector (default 30s)
+    auto_paginate: bool = False  # Click through SPA pagination where URL doesn't change
 
 @router.post("/scrape/llm-extract")
 async def scrape_and_extract(request: ExtractRequest):
@@ -667,7 +786,8 @@ async def scrape_and_extract(request: ExtractRequest):
             enable_scrolling=request.enable_scrolling,
             scrolling_type=request.scrolling_type,
             wait_for_selector=request.wait_for_selector,
-            wait_for_selector_timeout=request.wait_for_selector_timeout
+            wait_for_selector_timeout=request.wait_for_selector_timeout,
+            auto_paginate=request.auto_paginate
         )
         
         if error:
