@@ -133,6 +133,9 @@ async def auto_paginate_click(page, request_id: str, max_pages: int = 20, click_
 
     pages_html = [await page.content()]
     last_content_hash = hash(pages_html[0])
+    # Also collect raw <a href> values directly from the DOM — avoids the
+    # LLM URL-extraction mangling (parens stripping, hostname hallucination).
+    pages_hrefs = [await page.eval_on_selector_all('a[href]', 'els => els.map(e => e.href)')]
 
     for i in range(max_pages - 1):
         btn, selector = await find_next_button()
@@ -172,14 +175,99 @@ async def auto_paginate_click(page, request_id: str, max_pages: int = 20, click_
 
         pages_html.append(new_html)
         last_content_hash = new_hash
+        try:
+            pages_hrefs.append(await page.eval_on_selector_all('a[href]', 'els => els.map(e => e.href)'))
+        except Exception:
+            pages_hrefs.append([])
 
     if len(pages_html) > 1:
         logger.info(f"[{request_id}] Auto-pagination: collected {len(pages_html)} pages")
 
-    return pages_html
+    # Flatten + dedupe href list preserving order
+    seen = set()
+    flat_hrefs = []
+    for page_hrefs in pages_hrefs:
+        for h in page_hrefs:
+            if h and h not in seen:
+                seen.add(h)
+                flat_hrefs.append(h)
+
+    return pages_html, flat_hrefs
 
 
-async def perform_enhanced_scraping(url: str, request_id: str, delay_ms: int = 5000, enable_scrolling: Optional[bool] = None, scrolling_type: Literal["human", "bot"] = "bot", wait_for_selector: Optional[str] = None, wait_for_selector_timeout: int = 30000, auto_paginate: bool = False):
+def _url_is_pdf(url: str) -> bool:
+    """Return True if the URL unambiguously points to a PDF."""
+    try:
+        path = url.split('?')[0].split('#')[0].lower()
+        return path.endswith('.pdf')
+    except Exception:
+        return False
+
+
+async def _fetch_pdf_as_html(url: str, request_id: str) -> tuple:
+    """
+    Fetch a PDF and extract its text via pdfplumber.
+    Return the text wrapped in a minimal HTML envelope so the downstream
+    markdown + LLM extraction pipeline treats it like any other page.
+
+    Returns (html_content, error_dict or None).
+    """
+    import httpx
+    from io import BytesIO
+    import html as html_lib
+
+    try:
+        logger.info(f"[{request_id}] PDF fetch: {url}")
+        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+            resp = await client.get(url, headers={
+                'User-Agent': ua.random,
+                'Accept': 'application/pdf,*/*',
+            })
+        if resp.status_code != 200:
+            logger.warning(f"[{request_id}] PDF fetch: HTTP {resp.status_code}")
+            return None, {
+                "status": "error",
+                "error": f"PDF fetch returned {resp.status_code}",
+            }
+
+        ctype = (resp.headers.get('content-type') or '').lower()
+        if 'pdf' not in ctype and not resp.content.startswith(b'%PDF'):
+            logger.warning(f"[{request_id}] PDF fetch: not a PDF (content-type={ctype!r}, starts with {resp.content[:8]!r})")
+            return None, {
+                "status": "error",
+                "error": "URL did not return a PDF (wrong content-type or magic bytes)",
+            }
+
+        if len(resp.content) > 25 * 1024 * 1024:
+            return None, {"status": "error", "error": "PDF exceeds 25MB size limit"}
+
+        import pdfplumber
+        text_parts = []
+        with pdfplumber.open(BytesIO(resp.content)) as pdf:
+            for page in pdf.pages:
+                page_text = page.extract_text() or ''
+                if page_text:
+                    text_parts.append(page_text)
+        text = '\n\n'.join(text_parts).strip()
+
+        if not text:
+            logger.warning(f"[{request_id}] PDF fetch: pdfplumber returned empty text (possibly scanned/image-only PDF)")
+            return None, {
+                "status": "error",
+                "error": "PDF contains no extractable text (may be scanned image)",
+            }
+
+        safe_text = html_lib.escape(text)
+        html_content = f"<html><body><pre>{safe_text}</pre></body></html>"
+        logger.info(f"[{request_id}] PDF fetch: extracted {len(text)} chars across {len(text_parts)} pages")
+        return html_content, None
+
+    except Exception as e:
+        logger.error(f"[{request_id}] PDF fetch failed: {e}")
+        return None, {"status": "error", "error": f"PDF processing failed: {e}"}
+
+
+async def perform_enhanced_scraping(url: str, request_id: str, delay_ms: int = 5000, enable_scrolling: Optional[bool] = None, scrolling_type: Literal["human", "bot"] = "bot", wait_for_selector: Optional[str] = None, wait_for_selector_timeout: int = 30000, auto_paginate: bool = False, enable_pdf: bool = False, dom_hrefs: Optional[list] = None):
     """
     Reusable enhanced scraping function with anti-detection measures.
     Auto-enables bot scrolling when delay_ms <= 5000 (unless explicitly set).
@@ -188,8 +276,18 @@ async def perform_enhanced_scraping(url: str, request_id: str, delay_ms: int = 5
     SPAs (where the URL does not change on page change), click through it, and
     return the combined HTML of all visited pages separated by a marker comment.
 
+    When enable_pdf=True and the URL points to a .pdf file, fetch it via httpx
+    and extract text with pdfplumber instead of launching Playwright. Returns
+    the text wrapped as minimal HTML so downstream markdown + LLM extraction
+    works unchanged. This path is opt-in because PDF text extraction is lossy
+    for scanned / image-only PDFs and we don't want it on by default.
+
     Returns: (html_content, error_dict or None)
     """
+    # Short-circuit: PDF handling path (skips Playwright entirely)
+    if enable_pdf and _url_is_pdf(url):
+        return await _fetch_pdf_as_html(url, request_id)
+
     # Auto-enable bot scrolling for delay <= 5000ms if not explicitly set
     if enable_scrolling is None:
         enable_scrolling = delay_ms <= 5000
@@ -502,13 +600,15 @@ async def perform_enhanced_scraping(url: str, request_id: str, delay_ms: int = 5
                 await page.wait_for_timeout(2000)
 
                 if auto_paginate:
-                    pages_html = await auto_paginate_click(page, request_id)
+                    pages_html, dom_hrefs_collected = await auto_paginate_click(page, request_id)
                     if len(pages_html) > 1:
                         html_content = '\n\n<!-- PAGE_SEPARATOR -->\n\n'.join(pages_html)
-                        logger.info(f"[{request_id}] HTML content extracted from {len(pages_html)} pages (total size: {len(html_content)} chars)")
+                        logger.info(f"[{request_id}] HTML content extracted from {len(pages_html)} pages (total size: {len(html_content)} chars, {len(dom_hrefs_collected)} dedup hrefs)")
                     else:
                         html_content = pages_html[0]
-                        logger.info(f"[{request_id}] HTML content extracted (size: {len(html_content)} chars) — no pagination detected")
+                        logger.info(f"[{request_id}] HTML content extracted (size: {len(html_content)} chars, {len(dom_hrefs_collected)} dedup hrefs) — no pagination detected")
+                    if dom_hrefs is not None:
+                        dom_hrefs.extend(dom_hrefs_collected)
                 else:
                     logger.info(f"[{request_id}] Extracting page content...")
                     html_content = await page.content()
@@ -573,7 +673,8 @@ async def scrape_url(
     delay_ms: int = 5000,
     wait_for_selector: Optional[str] = None,
     wait_for_selector_timeout: int = 30000,
-    auto_paginate: bool = False
+    auto_paginate: bool = False,
+    enable_pdf: bool = False
 ):
     start_time = time.time()
     request_id = f"{int(time.time() * 1000)}"
@@ -593,7 +694,8 @@ async def scrape_url(
             scrolling_type=scrolling_type,
             wait_for_selector=wait_for_selector,
             wait_for_selector_timeout=wait_for_selector_timeout,
-            auto_paginate=auto_paginate
+            auto_paginate=auto_paginate,
+            enable_pdf=enable_pdf
         )
 
         if error:
@@ -655,6 +757,7 @@ class ScrapeRequest(BaseModel):
     wait_for_selector: Optional[str] = None
     wait_for_selector_timeout: int = 30000
     auto_paginate: bool = False  # Click through SPA pagination where URL doesn't change
+    enable_pdf: bool = False  # When URL is a .pdf, fetch + extract text via pdfplumber
 
 
 @router.post("/scrape")
@@ -667,7 +770,8 @@ async def scrape_url_post(request: ScrapeRequest):
         delay_ms=request.delay_ms,
         wait_for_selector=request.wait_for_selector,
         wait_for_selector_timeout=request.wait_for_selector_timeout,
-        auto_paginate=request.auto_paginate
+        auto_paginate=request.auto_paginate,
+        enable_pdf=request.enable_pdf
     )
 
 
@@ -761,6 +865,7 @@ class ExtractRequest(BaseModel):
     wait_for_selector: Optional[str] = None  # CSS selector to wait for before capturing content (useful for SPAs)
     wait_for_selector_timeout: int = 30000  # Timeout in ms for wait_for_selector (default 30s)
     auto_paginate: bool = False  # Click through SPA pagination where URL doesn't change
+    enable_pdf: bool = False  # When URL is a .pdf, fetch + extract text via pdfplumber
 
 @router.post("/scrape/llm-extract")
 async def scrape_and_extract(request: ExtractRequest):
@@ -788,6 +893,11 @@ async def scrape_and_extract(request: ExtractRequest):
         # Use enhanced in-house scraping with anti-detection measures
         scrape_start = time.time()
         
+        # Collector for DOM hrefs gathered during auto-pagination (if any).
+        # Exposed in the response so callers can prefer raw DOM hrefs over
+        # LLM-extracted URLs for accuracy.
+        dom_hrefs: list = []
+
         # Use the enhanced scraping function
         html_content, error = await perform_enhanced_scraping(
             request.url,
@@ -797,7 +907,9 @@ async def scrape_and_extract(request: ExtractRequest):
             scrolling_type=request.scrolling_type,
             wait_for_selector=request.wait_for_selector,
             wait_for_selector_timeout=request.wait_for_selector_timeout,
-            auto_paginate=request.auto_paginate
+            auto_paginate=request.auto_paginate,
+            enable_pdf=request.enable_pdf,
+            dom_hrefs=dom_hrefs
         )
         
         if error:
@@ -897,6 +1009,7 @@ async def scrape_and_extract(request: ExtractRequest):
             "model_used": request.model,
             "scraping_method": "playwright",
             "debug_mode": settings.DEBUG_MODE,
+            "dom_hrefs": dom_hrefs,
             "processing_time": {
                 "total": f"{total_time:.2f}s",
                 "scraping": f"{scrape_time:.2f}s",
