@@ -78,9 +78,11 @@ async def auto_paginate_click(page, request_id: str, max_pages: int = 20, click_
     Stops when no Next button is found, the button is disabled, content stops
     changing, or max_pages is reached.
     """
-    # Conservative, pagination-scoped selectors only — avoid naked text matches that
-    # could click unrelated "Next" buttons (wizard steps, carousels, etc.)
+    # Try scoped-and-safe selectors first, then fall back to exact-text matches
+    # on native clickable elements. The URL guard + content-hash check +
+    # max_pages cap protect against false positives from the broader Tier-2 set.
     NEXT_SELECTORS = [
+        # Tier 1: semantic / ARIA / well-known classes
         'a[rel="next"]',
         'nav[aria-label*="pagination" i] a:has-text("Next")',
         'nav[aria-label*="pagination" i] button:has-text("Next")',
@@ -92,6 +94,14 @@ async def auto_paginate_click(page, request_id: str, max_pages: int = 20, click_
         '.pagination button:has-text("Suivant")',
         'nav[aria-label*="pagination" i] [aria-label*="Next" i]',
         '.pagination [aria-label*="Next" i]',
+        # Tier 2: exact-text match on native clickable elements — catches custom
+        # Angular/React pagination that doesn't use .pagination or nav[pagination]
+        'button:text-is("Next")',
+        'a:text-is("Next")',
+        '[role="button"]:text-is("Next")',
+        'button:text-is("Suivant")',
+        'a:text-is("Suivant")',
+        '[role="button"]:text-is("Suivant")',
     ]
 
     async def find_next_button():
