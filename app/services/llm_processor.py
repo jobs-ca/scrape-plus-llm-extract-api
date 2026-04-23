@@ -135,12 +135,15 @@ class LLMProcessor:
             if getattr(self, "_using_together", False):
                 litellm.drop_params = True
             
-            # Use litellm acompletion without max_tokens - let LLM use its default
+            # Set max_tokens high enough to fit URL-extraction lists from multi-page
+            # (auto-paginated SPA) careers pages. gpt-oss-20b defaults to ~1024 output
+            # tokens which truncates JSON mid-response when we ask for ~55 URLs.
             request_kwargs = {
                 "model": self.litellm_model,
                 "messages": messages,
                 "temperature": 0,
                 "timeout": 300,
+                "max_tokens": 16000,
             }
             # Only OpenAI-compatible providers support response_format
             if not (self.model.startswith("gemini") or self.model.startswith("claude") or self.model.startswith("grok")):
