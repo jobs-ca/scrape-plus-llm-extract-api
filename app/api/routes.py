@@ -516,12 +516,39 @@ async def perform_enhanced_scraping(url: str, request_id: str, delay_ms: int = 5
             """)
 
             try:
-                # Navigate with extended timeout for Cloudflare challenges and SPAs
-                logger.info(f"[{request_id}] Navigating to URL with 60s timeout...")
-                await page.goto(url,
-                    wait_until='networkidle',  # waits for all network requests (API calls, JS bundles) to finish - handles SPAs correctly
-                    timeout=60000  # 60 second timeout for slow sites/Cloudflare/large JS bundles
-                )
+                # Navigate with a two-stage wait strategy.
+                #
+                # Earlier flow: single-shot `wait_until='networkidle'` with
+                # 60s timeout. That fixed Metro / SAP SuccessFactors pages
+                # where the JS bundle finishes rendering only after all
+                # API calls quiet down. But it broke modern Next.js SPAs
+                # like cursor.com — they emit continuous telemetry pings
+                # so networkidle never fires and Playwright times out.
+                #
+                # New flow: try networkidle with a shorter 25s window
+                # (still catches Metro/SAP within ~10-15s in practice).
+                # On timeout, retry with wait_until='domcontentloaded'
+                # and a 20s window. domcontentloaded returns as soon as
+                # the HTML skeleton is parsed — enough for the LLM to
+                # extract job info from the initial payload on sites that
+                # never network-idle. Total worst case is ~45s, still
+                # under the caller's 60s budget on jc-ats-apis.
+                logger.info(f"[{request_id}] Navigating to URL — networkidle (25s), fallback domcontentloaded (20s)...")
+                try:
+                    await page.goto(url,
+                        wait_until='networkidle',
+                        timeout=25000,
+                    )
+                except PlaywrightTimeout:
+                    logger.warning(
+                        f"[{request_id}] networkidle timed out (likely a modern SPA "
+                        f"with continuous background requests); falling back to "
+                        f"domcontentloaded"
+                    )
+                    await page.goto(url,
+                        wait_until='domcontentloaded',
+                        timeout=20000,
+                    )
             
                 # Check for Cloudflare challenge
                 page_title = await page.title()
